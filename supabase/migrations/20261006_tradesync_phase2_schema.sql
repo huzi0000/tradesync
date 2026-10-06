@@ -1,11 +1,16 @@
 -- ============================================================================
--- TRADESYNC DATABASE SCHEMA — HARDENED PRODUCTION RELEASE
+-- TRADESYNC DATABASE SCHEMA — CRYPTOGRAPHICALLY HARDENED PRODUCTION RELEASE
 -- Collaborative Solana Trading Intelligence Workspace
--- PostgreSQL / Supabase Compatible Migration
+-- PostgreSQL / Supabase Migration
 -- ============================================================================
 
--- Ensure pgcrypto extension for gen_random_uuid()
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+-- Ensure pgcrypto extension if available (PostgreSQL 13+ includes gen_random_uuid natively)
+DO $$
+BEGIN
+  CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+EXCEPTION WHEN OTHERS THEN
+  NULL;
+END $$;
 
 -- ----------------------------------------------------------------------------
 -- 1. USER PROFILES & WALLET IDENTITIES
@@ -117,13 +122,13 @@ CREATE TABLE IF NOT EXISTS public.room_posts (
 CREATE INDEX IF NOT EXISTS idx_room_posts_room_created ON public.room_posts (room_id, created_at DESC);
 
 -- ----------------------------------------------------------------------------
--- 5. VERIFIED TRADE RECORDS
+-- 5. VERIFIED TRADE RECORDS (IMMUTABLE ON-CHAIN PROOFS)
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.verified_trade_records (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     room_id UUID REFERENCES public.trading_rooms(id) ON DELETE SET NULL,
     submitted_by UUID NOT NULL REFERENCES public.user_profiles(id) ON DELETE CASCADE,
-    signature VARCHAR(88) NOT NULL,
+    signature VARCHAR(96) NOT NULL,
     slot BIGINT NOT NULL,
     block_time TIMESTAMPTZ,
     dex_name VARCHAR(64) NOT NULL,
@@ -219,10 +224,26 @@ CREATE TABLE IF NOT EXISTS public.user_settings (
 );
 
 -- ----------------------------------------------------------------------------
--- 9. SECURITY DEFINER HELPER FUNCTIONS (AVOIDS RLS RECURSION & PRIVILEGE LEAKS)
+-- 9. SECURITY DEFINER HELPER FUNCTIONS (HARDENED SEARCH PATH & LEAST PRIVILEGE)
 -- ----------------------------------------------------------------------------
 
--- Check room membership without triggering recursive RLS queries on room_members
+-- 9.1 Resolves current authenticated user UUID from auth.uid() or verified JWT wallet claims
+CREATE OR REPLACE FUNCTION public.get_current_user_id()
+RETURNS UUID
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+STABLE
+AS $$
+  SELECT id FROM public.user_profiles
+  WHERE (auth.uid() IS NOT NULL AND id = auth.uid())
+     OR (NULLIF(auth.jwt() ->> 'wallet_address', '') IS NOT NULL AND wallet_address = (auth.jwt() ->> 'wallet_address'))
+     OR (NULLIF(auth.jwt() -> 'app_metadata' ->> 'wallet_address', '') IS NOT NULL AND wallet_address = (auth.jwt() -> 'app_metadata' ->> 'wallet_address'))
+     OR (NULLIF(auth.jwt() -> 'user_metadata' ->> 'wallet_address', '') IS NOT NULL AND wallet_address = (auth.jwt() -> 'user_metadata' ->> 'wallet_address'))
+  LIMIT 1;
+$$;
+
+-- 9.2 Check room membership non-recursively (eliminates 42P17 recursion)
 CREATE OR REPLACE FUNCTION public.check_is_room_member(p_room_id UUID, p_user_id UUID)
 RETURNS BOOLEAN
 LANGUAGE sql
@@ -230,13 +251,16 @@ SECURITY DEFINER
 SET search_path = public
 STABLE
 AS $$
-  SELECT EXISTS (
-    SELECT 1 FROM public.room_members
-    WHERE room_id = p_room_id AND user_id = p_user_id
-  );
+  SELECT CASE
+    WHEN p_user_id IS NULL OR p_room_id IS NULL THEN FALSE
+    ELSE EXISTS (
+      SELECT 1 FROM public.room_members
+      WHERE room_id = p_room_id AND user_id = p_user_id
+    )
+  END;
 $$;
 
--- Check room admin status safely
+-- 9.3 Check room admin status non-recursively
 CREATE OR REPLACE FUNCTION public.check_is_room_admin(p_room_id UUID, p_user_id UUID)
 RETURNS BOOLEAN
 LANGUAGE sql
@@ -244,13 +268,16 @@ SECURITY DEFINER
 SET search_path = public
 STABLE
 AS $$
-  SELECT EXISTS (
-    SELECT 1 FROM public.room_members
-    WHERE room_id = p_room_id AND user_id = p_user_id AND role = 'admin'
-  );
+  SELECT CASE
+    WHEN p_user_id IS NULL OR p_room_id IS NULL THEN FALSE
+    ELSE EXISTS (
+      SELECT 1 FROM public.room_members
+      WHERE room_id = p_room_id AND user_id = p_user_id AND role = 'admin'
+    )
+  END;
 $$;
 
--- Resolve or initialize user profile by wallet address safely on server
+-- 9.4 Profile creation / resolution: RESTRICTED TO SERVICE_ROLE & MATCHING WALLET
 CREATE OR REPLACE FUNCTION public.get_or_create_user_profile(p_wallet_address VARCHAR(44))
 RETURNS UUID
 LANGUAGE plpgsql
@@ -259,7 +286,28 @@ SET search_path = public
 AS $$
 DECLARE
   v_user_id UUID;
+  v_caller_role TEXT;
+  v_jwt_wallet TEXT;
 BEGIN
+  -- Validate format of Solana address
+  IF p_wallet_address IS NULL OR LENGTH(p_wallet_address) < 32 OR LENGTH(p_wallet_address) > 44 THEN
+    RAISE EXCEPTION 'Invalid Solana wallet address format.';
+  END IF;
+
+  v_caller_role := COALESCE(NULLIF(current_setting('request.jwt.claim.role', true), ''), auth.role());
+  v_jwt_wallet := COALESCE(
+    NULLIF(auth.jwt() ->> 'wallet_address', ''),
+    NULLIF(auth.jwt() -> 'app_metadata' ->> 'wallet_address', ''),
+    NULLIF(current_setting('request.jwt.claim.wallet_address', true), '')
+  );
+
+  -- Impersonation check: Non-service callers cannot resolve arbitrary wallets
+  IF v_caller_role IS NOT NULL AND v_caller_role NOT IN ('service_role', 'supabase_admin') THEN
+    IF v_jwt_wallet IS NULL OR v_jwt_wallet != p_wallet_address THEN
+      RAISE EXCEPTION 'Unauthorized: cannot access or create profile for another wallet.';
+    END IF;
+  END IF;
+
   SELECT id INTO v_user_id FROM public.user_profiles WHERE wallet_address = p_wallet_address;
   IF v_user_id IS NULL THEN
     INSERT INTO public.user_profiles (wallet_address, display_name)
@@ -269,12 +317,142 @@ BEGIN
     )
     RETURNING id INTO v_user_id;
   END IF;
+
   RETURN v_user_id;
 END;
 $$;
 
+-- Revoke public execution to prevent profile enumeration/forgery
+REVOKE ALL ON FUNCTION public.get_or_create_user_profile(VARCHAR) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.get_or_create_user_profile(VARCHAR) FROM anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.get_or_create_user_profile(VARCHAR) TO service_role;
+
+-- 9.5 Atomic Server/Function Invitation Join Procedure
+CREATE OR REPLACE FUNCTION public.join_room_by_invite(
+  p_room_id UUID,
+  p_invite_code VARCHAR(32),
+  p_user_id UUID
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_invitation RECORD;
+  v_room RECORD;
+  v_current_count INT;
+BEGIN
+  IF p_user_id IS NULL OR p_room_id IS NULL OR p_invite_code IS NULL THEN
+    RAISE EXCEPTION 'Invalid parameters for joining room.';
+  END IF;
+
+  -- Verify room exists
+  SELECT * INTO v_room FROM public.trading_rooms WHERE id = p_room_id;
+  IF v_room IS NULL THEN
+    RAISE EXCEPTION 'Room not found.';
+  END IF;
+
+  -- If room is private, validate invite code
+  IF v_room.is_private THEN
+    -- Check room invitation record or default room invite code
+    SELECT * INTO v_invitation
+    FROM public.room_invitations
+    WHERE room_id = p_room_id
+      AND invite_code = p_invite_code
+      AND (expires_at IS NULL OR expires_at > NOW())
+      AND used_count < max_uses;
+
+    IF v_invitation IS NULL AND v_room.invite_code != p_invite_code THEN
+      RAISE EXCEPTION 'Invalid or expired invitation code.';
+    END IF;
+  END IF;
+
+  -- Check capacity
+  SELECT COUNT(*) INTO v_current_count FROM public.room_members WHERE room_id = p_room_id;
+  IF v_current_count >= v_room.max_members THEN
+    RAISE EXCEPTION 'Room has reached maximum member capacity.';
+  END IF;
+
+  -- Insert member as 'member' (never admin)
+  INSERT INTO public.room_members (room_id, user_id, role)
+  VALUES (p_room_id, p_user_id, 'member')
+  ON CONFLICT (room_id, user_id) DO NOTHING;
+
+  -- Increment invitation usage if applicable
+  IF v_invitation IS NOT NULL THEN
+    UPDATE public.room_invitations
+    SET used_count = used_count + 1
+    WHERE id = v_invitation.id;
+  END IF;
+
+  RETURN TRUE;
+END;
+$$;
+
 -- ----------------------------------------------------------------------------
--- 10. ROW-LEVEL SECURITY (RLS) POLICIES — FULL HARDENING
+-- 10. DATABASE INTEGRITY TRIGGERS (DEFENSE IN DEPTH)
+-- ----------------------------------------------------------------------------
+
+-- 10.1 Enforce room member integrity & prevent privilege escalation
+CREATE OR REPLACE FUNCTION public.trg_enforce_room_member_integrity()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  -- Prevent privilege escalation: role='admin' can ONLY be assigned if the user is the room creator
+  IF NEW.role = 'admin' THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM public.trading_rooms
+      WHERE id = NEW.room_id AND created_by = NEW.user_id
+    ) THEN
+      RAISE EXCEPTION 'Privilege escalation rejected: only the room creator can be an admin.';
+    END IF;
+  END IF;
+
+  -- Enforce member limit
+  IF (SELECT COUNT(*) FROM public.room_members WHERE room_id = NEW.room_id) >= 
+     (SELECT max_members FROM public.trading_rooms WHERE id = NEW.room_id) THEN
+    RAISE EXCEPTION 'Room has reached maximum member capacity.';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_room_members_integrity ON public.room_members;
+CREATE TRIGGER trg_room_members_integrity
+BEFORE INSERT ON public.room_members
+FOR EACH ROW
+EXECUTE FUNCTION public.trg_enforce_room_member_integrity();
+
+-- 10.2 Enforce verified trade record integrity
+CREATE OR REPLACE FUNCTION public.trg_validate_verified_trade_record()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF NEW.room_id IS NOT NULL THEN
+    IF NOT public.check_is_room_member(NEW.room_id, NEW.submitted_by) THEN
+      RAISE EXCEPTION 'Unauthorized: Submitter must be an active member of the room.';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_validate_verified_trade_record ON public.verified_trade_records;
+CREATE TRIGGER trg_validate_verified_trade_record
+BEFORE INSERT ON public.verified_trade_records
+FOR EACH ROW
+EXECUTE FUNCTION public.trg_validate_verified_trade_record();
+
+-- ----------------------------------------------------------------------------
+-- 11. ROW-LEVEL SECURITY (RLS) POLICIES — COMPREHENSIVE HARDENING
 -- ----------------------------------------------------------------------------
 
 ALTER TABLE public.user_profiles ENABLE ROW LEVEL SECURITY;
@@ -291,198 +469,251 @@ ALTER TABLE public.alert_rules ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.alert_history ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.user_settings ENABLE ROW LEVEL SECURITY;
 
--- 10.1 User Profiles
+-- 11.1 User Profiles
+DROP POLICY IF EXISTS "Profiles are viewable by everyone" ON public.user_profiles;
 CREATE POLICY "Profiles are viewable by everyone"
     ON public.user_profiles FOR SELECT
     USING (true);
 
-CREATE POLICY "Users can create or update their own profile"
-    ON public.user_profiles FOR ALL
-    USING (auth.uid() = id OR wallet_address = (auth.jwt() ->> 'wallet_address'))
-    WITH CHECK (auth.uid() = id OR wallet_address = (auth.jwt() ->> 'wallet_address'));
+DROP POLICY IF EXISTS "Users can create or update their own profile" ON public.user_profiles;
+CREATE POLICY "Users can create their own profile"
+    ON public.user_profiles FOR INSERT
+    WITH CHECK (
+        id = public.get_current_user_id()
+        OR (auth.role() = 'authenticated' AND wallet_address = (auth.jwt() ->> 'wallet_address'))
+    );
 
--- 10.2 Wallet Identities
+CREATE POLICY "Users can update their own profile"
+    ON public.user_profiles FOR UPDATE
+    USING (id = public.get_current_user_id())
+    WITH CHECK (id = public.get_current_user_id());
+
+-- 11.2 Wallet Identities
+DROP POLICY IF EXISTS "Users view own wallet identities" ON public.wallet_identities;
 CREATE POLICY "Users view own wallet identities"
     ON public.wallet_identities FOR SELECT
-    USING (user_id = auth.uid() OR wallet_address = (auth.jwt() ->> 'wallet_address'));
+    USING (user_id = public.get_current_user_id());
 
+DROP POLICY IF EXISTS "Users manage own wallet identities" ON public.wallet_identities;
 CREATE POLICY "Users manage own wallet identities"
     ON public.wallet_identities FOR ALL
-    USING (user_id = auth.uid() OR wallet_address = (auth.jwt() ->> 'wallet_address'))
-    WITH CHECK (user_id = auth.uid() OR wallet_address = (auth.jwt() ->> 'wallet_address'));
+    USING (user_id = public.get_current_user_id())
+    WITH CHECK (user_id = public.get_current_user_id());
 
--- 10.3 Tracked Wallets
+-- 11.3 Tracked Wallets
+DROP POLICY IF EXISTS "Users manage their own tracked wallets" ON public.tracked_wallets;
 CREATE POLICY "Users manage their own tracked wallets"
     ON public.tracked_wallets FOR ALL
-    USING (user_id = auth.uid() OR user_id IN (SELECT id FROM public.user_profiles WHERE wallet_address = (auth.jwt() ->> 'wallet_address')))
-    WITH CHECK (user_id = auth.uid() OR user_id IN (SELECT id FROM public.user_profiles WHERE wallet_address = (auth.jwt() ->> 'wallet_address')));
+    USING (user_id = public.get_current_user_id())
+    WITH CHECK (user_id = public.get_current_user_id());
 
--- 10.4 Trading Rooms
+-- 11.4 Trading Rooms
+DROP POLICY IF EXISTS "Rooms viewable by members or public" ON public.trading_rooms;
 CREATE POLICY "Rooms viewable by members or public"
     ON public.trading_rooms FOR SELECT
     USING (
-        NOT is_private OR
-        public.check_is_room_member(id, auth.uid()) OR
-        created_by = auth.uid()
+        NOT is_private
+        OR public.check_is_room_member(id, public.get_current_user_id())
+        OR created_by = public.get_current_user_id()
     );
 
+DROP POLICY IF EXISTS "Authenticated users can create rooms" ON public.trading_rooms;
 CREATE POLICY "Authenticated users can create rooms"
     ON public.trading_rooms FOR INSERT
     WITH CHECK (
-        created_by = auth.uid() OR
-        created_by IN (SELECT id FROM public.user_profiles WHERE wallet_address = (auth.jwt() ->> 'wallet_address'))
+        created_by = public.get_current_user_id()
     );
 
+DROP POLICY IF EXISTS "Room admins can update rooms" ON public.trading_rooms;
 CREATE POLICY "Room admins can update rooms"
     ON public.trading_rooms FOR UPDATE
     USING (
-        public.check_is_room_admin(id, auth.uid()) OR
-        created_by = auth.uid()
+        public.check_is_room_admin(id, public.get_current_user_id())
+        OR created_by = public.get_current_user_id()
     );
 
+DROP POLICY IF EXISTS "Room admins can delete rooms" ON public.trading_rooms;
 CREATE POLICY "Room admins can delete rooms"
     ON public.trading_rooms FOR DELETE
     USING (
-        public.check_is_room_admin(id, auth.uid()) OR
-        created_by = auth.uid()
+        public.check_is_room_admin(id, public.get_current_user_id())
+        OR created_by = public.get_current_user_id()
     );
 
--- 10.5 Room Members (Non-recursive)
+-- 11.5 Room Members (Zero Unauthorized Joins, Zero Self-Admin Escalation)
+DROP POLICY IF EXISTS "Room members viewable by members or public room" ON public.room_members;
 CREATE POLICY "Room members viewable by members or public room"
     ON public.room_members FOR SELECT
     USING (
-        user_id = auth.uid() OR
-        public.check_is_room_member(room_id, auth.uid()) OR
-        EXISTS (SELECT 1 FROM public.trading_rooms WHERE id = room_id AND NOT is_private)
+        user_id = public.get_current_user_id()
+        OR public.check_is_room_member(room_id, public.get_current_user_id())
+        OR EXISTS (SELECT 1 FROM public.trading_rooms WHERE id = room_id AND NOT is_private)
     );
 
-CREATE POLICY "Users can join rooms"
+DROP POLICY IF EXISTS "Members can join public rooms only" ON public.room_members;
+CREATE POLICY "Users can insert room membership"
     ON public.room_members FOR INSERT
     WITH CHECK (
-        user_id = auth.uid() OR
-        user_id IN (SELECT id FROM public.user_profiles WHERE wallet_address = (auth.jwt() ->> 'wallet_address'))
+        -- 1. Must be inserting for oneself
+        user_id = public.get_current_user_id()
+        AND (
+            -- Case 1: Room creator can add themselves to their own room (as admin or member)
+            EXISTS (
+                SELECT 1 FROM public.trading_rooms
+                WHERE id = room_id AND created_by = public.get_current_user_id()
+            )
+            -- Case 2: Regular user joining a public room (strictly as 'member')
+            OR (
+                role = 'member'
+                AND EXISTS (
+                    SELECT 1 FROM public.trading_rooms
+                    WHERE id = room_id AND NOT is_private
+                )
+            )
+        )
     );
 
+DROP POLICY IF EXISTS "Users can leave rooms or admins can remove members" ON public.room_members;
 CREATE POLICY "Users can leave rooms or admins can remove members"
     ON public.room_members FOR DELETE
     USING (
-        user_id = auth.uid() OR
-        public.check_is_room_admin(room_id, auth.uid())
+        user_id = public.get_current_user_id()
+        OR public.check_is_room_admin(room_id, public.get_current_user_id())
     );
 
--- 10.6 Room Invitations
+-- 11.6 Room Invitations
+DROP POLICY IF EXISTS "Invitations viewable by room members" ON public.room_invitations;
 CREATE POLICY "Invitations viewable by room members"
     ON public.room_invitations FOR SELECT
     USING (
-        public.check_is_room_member(room_id, auth.uid()) OR
-        created_by = auth.uid()
+        public.check_is_room_member(room_id, public.get_current_user_id())
     );
 
+DROP POLICY IF EXISTS "Room admins can create invitations" ON public.room_invitations;
 CREATE POLICY "Room admins can create invitations"
     ON public.room_invitations FOR INSERT
     WITH CHECK (
-        public.check_is_room_admin(room_id, auth.uid()) OR
-        created_by = auth.uid()
+        public.check_is_room_admin(room_id, public.get_current_user_id())
+        AND created_by = public.get_current_user_id()
     );
 
--- 10.7 Room Posts
+-- 11.7 Room Posts (Requires BOTH Verified Authorship AND Active Room Membership)
+DROP POLICY IF EXISTS "Room posts viewable by members or public" ON public.room_posts;
 CREATE POLICY "Room posts viewable by members or public"
     ON public.room_posts FOR SELECT
     USING (
-        public.check_is_room_member(room_id, auth.uid()) OR
-        EXISTS (SELECT 1 FROM public.trading_rooms WHERE id = room_id AND NOT is_private)
+        public.check_is_room_member(room_id, public.get_current_user_id())
+        OR EXISTS (SELECT 1 FROM public.trading_rooms WHERE id = room_id AND NOT is_private)
     );
 
-CREATE POLICY "Room members can create posts"
+DROP POLICY IF EXISTS "Room members can create posts" ON public.room_posts;
+CREATE POLICY "Verified room members can create posts"
     ON public.room_posts FOR INSERT
     WITH CHECK (
-        public.check_is_room_member(room_id, auth.uid()) OR
-        author_id = auth.uid() OR
-        author_id IN (SELECT id FROM public.user_profiles WHERE wallet_address = (auth.jwt() ->> 'wallet_address'))
+        -- Strict requirement 1: Caller must be the author
+        author_id = public.get_current_user_id()
+        -- Strict requirement 2: Caller must be an active member of this specific room
+        AND public.check_is_room_member(room_id, public.get_current_user_id())
     );
 
-CREATE POLICY "Post authors can delete their posts"
+DROP POLICY IF EXISTS "Post authors can delete their posts" ON public.room_posts;
+CREATE POLICY "Post authors or room admins can delete posts"
     ON public.room_posts FOR DELETE
     USING (
-        author_id = auth.uid() OR
-        public.check_is_room_admin(room_id, auth.uid())
+        author_id = public.get_current_user_id()
+        OR public.check_is_room_admin(room_id, public.get_current_user_id())
     );
 
--- 10.8 Verified Trade Records
+-- 11.8 Verified Trade Records (FORBIDS CLIENT INSERT; SERVICE_ROLE ONLY)
+DROP POLICY IF EXISTS "Verified trades viewable by room members or public" ON public.verified_trade_records;
 CREATE POLICY "Verified trades viewable by room members or public"
     ON public.verified_trade_records FOR SELECT
     USING (
-        room_id IS NULL OR
-        public.check_is_room_member(room_id, auth.uid()) OR
-        EXISTS (SELECT 1 FROM public.trading_rooms WHERE id = room_id AND NOT is_private)
+        room_id IS NULL
+        OR public.check_is_room_member(room_id, public.get_current_user_id())
+        OR EXISTS (SELECT 1 FROM public.trading_rooms WHERE id = room_id AND NOT is_private)
     );
 
-CREATE POLICY "Members can submit verified trades"
+-- Direct client INSERT is completely forbidden to prevent trade forgery
+DROP POLICY IF EXISTS "Members can submit verified trades" ON public.verified_trade_records;
+CREATE POLICY "Direct client insert forbidden on verified trades"
     ON public.verified_trade_records FOR INSERT
-    WITH CHECK (
-        submitted_by = auth.uid() OR
-        submitted_by IN (SELECT id FROM public.user_profiles WHERE wallet_address = (auth.jwt() ->> 'wallet_address'))
-    );
+    WITH CHECK (false);
 
--- 10.9 Shared Watchlists & Tokens
+CREATE POLICY "Direct client update forbidden on verified trades"
+    ON public.verified_trade_records FOR UPDATE
+    USING (false);
+
+CREATE POLICY "Direct client delete forbidden on verified trades"
+    ON public.verified_trade_records FOR DELETE
+    USING (false);
+
+-- 11.9 Shared Watchlists & Tokens
+DROP POLICY IF EXISTS "Watchlists viewable by room members" ON public.shared_watchlists;
 CREATE POLICY "Watchlists viewable by room members"
     ON public.shared_watchlists FOR SELECT
     USING (
-        public.check_is_room_member(room_id, auth.uid()) OR
-        EXISTS (SELECT 1 FROM public.trading_rooms WHERE id = room_id AND NOT is_private)
+        public.check_is_room_member(room_id, public.get_current_user_id())
+        OR EXISTS (SELECT 1 FROM public.trading_rooms WHERE id = room_id AND NOT is_private)
     );
 
+DROP POLICY IF EXISTS "Members can manage shared watchlists" ON public.shared_watchlists;
 CREATE POLICY "Members can manage shared watchlists"
     ON public.shared_watchlists FOR ALL
-    USING (public.check_is_room_member(room_id, auth.uid()))
-    WITH CHECK (public.check_is_room_member(room_id, auth.uid()));
+    USING (public.check_is_room_member(room_id, public.get_current_user_id()))
+    WITH CHECK (public.check_is_room_member(room_id, public.get_current_user_id()));
 
+DROP POLICY IF EXISTS "Watchlist tokens viewable by room members" ON public.watchlist_tokens;
 CREATE POLICY "Watchlist tokens viewable by room members"
     ON public.watchlist_tokens FOR SELECT
     USING (
         EXISTS (
             SELECT 1 FROM public.shared_watchlists sw
             WHERE sw.id = watchlist_id AND (
-                public.check_is_room_member(sw.room_id, auth.uid()) OR
-                EXISTS (SELECT 1 FROM public.trading_rooms tr WHERE tr.id = sw.room_id AND NOT tr.is_private)
+                public.check_is_room_member(sw.room_id, public.get_current_user_id())
+                OR EXISTS (SELECT 1 FROM public.trading_rooms tr WHERE tr.id = sw.room_id AND NOT tr.is_private)
             )
         )
     );
 
+DROP POLICY IF EXISTS "Members can manage watchlist tokens" ON public.watchlist_tokens;
 CREATE POLICY "Members can manage watchlist tokens"
     ON public.watchlist_tokens FOR ALL
     USING (
         EXISTS (
             SELECT 1 FROM public.shared_watchlists sw
-            WHERE sw.id = watchlist_id AND public.check_is_room_member(sw.room_id, auth.uid())
+            WHERE sw.id = watchlist_id AND public.check_is_room_member(sw.room_id, public.get_current_user_id())
         )
     )
     WITH CHECK (
         EXISTS (
             SELECT 1 FROM public.shared_watchlists sw
-            WHERE sw.id = watchlist_id AND public.check_is_room_member(sw.room_id, auth.uid())
+            WHERE sw.id = watchlist_id AND public.check_is_room_member(sw.room_id, public.get_current_user_id())
         )
     );
 
--- 10.10 Alert Rules & History
+-- 11.10 Alert Rules & History
+DROP POLICY IF EXISTS "Users manage own alert rules" ON public.alert_rules;
 CREATE POLICY "Users manage own alert rules"
     ON public.alert_rules FOR ALL
-    USING (user_id = auth.uid() OR user_id IN (SELECT id FROM public.user_profiles WHERE wallet_address = (auth.jwt() ->> 'wallet_address')))
-    WITH CHECK (user_id = auth.uid() OR user_id IN (SELECT id FROM public.user_profiles WHERE wallet_address = (auth.jwt() ->> 'wallet_address')));
+    USING (user_id = public.get_current_user_id())
+    WITH CHECK (user_id = public.get_current_user_id());
 
+DROP POLICY IF EXISTS "Users manage own alert history" ON public.alert_history;
 CREATE POLICY "Users manage own alert history"
     ON public.alert_history FOR ALL
-    USING (user_id = auth.uid() OR user_id IN (SELECT id FROM public.user_profiles WHERE wallet_address = (auth.jwt() ->> 'wallet_address')))
-    WITH CHECK (user_id = auth.uid() OR user_id IN (SELECT id FROM public.user_profiles WHERE wallet_address = (auth.jwt() ->> 'wallet_address')));
+    USING (user_id = public.get_current_user_id())
+    WITH CHECK (user_id = public.get_current_user_id());
 
--- 10.11 User Settings
+-- 11.11 User Settings
+DROP POLICY IF EXISTS "Users manage own settings" ON public.user_settings;
 CREATE POLICY "Users manage own settings"
     ON public.user_settings FOR ALL
-    USING (user_id = auth.uid() OR user_id IN (SELECT id FROM public.user_profiles WHERE wallet_address = (auth.jwt() ->> 'wallet_address')))
-    WITH CHECK (user_id = auth.uid() OR user_id IN (SELECT id FROM public.user_profiles WHERE wallet_address = (auth.jwt() ->> 'wallet_address')));
+    USING (user_id = public.get_current_user_id())
+    WITH CHECK (user_id = public.get_current_user_id());
 
 -- ----------------------------------------------------------------------------
--- 11. SUPABASE REALTIME REPLICATION CONFIGURATION
+-- 12. SUPABASE REALTIME REPLICATION CONFIGURATION
 -- ----------------------------------------------------------------------------
 
 DO $$
