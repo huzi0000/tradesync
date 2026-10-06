@@ -3,7 +3,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { TrackedWallet } from '../types';
 import { isValidSolanaAddress } from '../lib/utils';
-import { getSupabaseBrowserClient, isSupabaseConfigured } from '@/lib/supabase/client';
 
 const STORAGE_KEY = 'tradesync:tracked_wallets';
 
@@ -35,7 +34,7 @@ export function useTrackedWallets(currentConnectedAddress?: string | null) {
   const [wallets, setWallets] = useState<TrackedWallet[]>([]);
   const [isLoaded, setIsLoaded] = useState(false);
 
-  // Load from persistent storage on mount + Supabase if configured
+  // Load from persistent storage on mount + server API if authenticated
   useEffect(() => {
     let isMounted = true;
     try {
@@ -52,38 +51,32 @@ export function useTrackedWallets(currentConnectedAddress?: string | null) {
     }
     setIsLoaded(true);
 
-    if (isSupabaseConfigured()) {
-      const supabase = getSupabaseBrowserClient();
-      if (supabase) {
-        Promise.resolve(
-          supabase
-            .from('tracked_wallets')
-            .select('*')
-            .eq('is_active', true)
-        )
-          .then(({ data: dbWallets, error }) => {
-            if (!error && dbWallets && dbWallets.length > 0 && isMounted) {
-              const mapped: TrackedWallet[] = dbWallets.map((w) => ({
-                id: w.id,
-                address: w.address,
-                label: w.label,
-                category: w.category as TrackedWallet['category'],
-                notes: w.notes || '',
-                addedAt: new Date(w.created_at).getTime(),
-                isOwnerVerified: w.is_owner_verified,
-                colorTag: w.color_tag || '#7D8A89',
-              }));
-              setWallets(mapped);
+    // Fetch from server API
+    fetch('/api/wallets/tracked')
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.wallets && data.wallets.length > 0 && isMounted) {
+          // Merge with curated defaults
+          setWallets((prev) => {
+            const merged = [...data.wallets];
+            for (const p of prev) {
+              if (!merged.some((m) => m.address === p.address)) {
+                merged.push(p);
+              }
             }
-          })
-          .catch(() => {});
-      }
-    }
+            try {
+              localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
+            } catch {}
+            return merged;
+          });
+        }
+      })
+      .catch(() => {});
 
     return () => {
       isMounted = false;
     };
-  }, []);
+  }, [currentConnectedAddress]);
 
   const save = useCallback((newWallets: TrackedWallet[]) => {
     try {
@@ -94,76 +87,76 @@ export function useTrackedWallets(currentConnectedAddress?: string | null) {
     setWallets(newWallets);
   }, []);
 
-  const addWallet = useCallback((
+  const addWallet = useCallback(async (
     address: string,
     label: string,
     category?: TrackedWallet['category'],
     notes?: string
-  ): { success: boolean; error?: string } => {
+  ): Promise<{ success: boolean; error?: string }> => {
     const trimmed = address.trim();
     if (!isValidSolanaAddress(trimmed)) {
       return { success: false, error: 'Invalid Solana base58 public address.' };
     }
 
-    if (wallets.some(w => w.address === trimmed)) {
+    if (wallets.some((w) => w.address === trimmed)) {
       return { success: false, error: 'This wallet is already in your tracking watchlist.' };
     }
 
     const isConnectedUser = currentConnectedAddress === trimmed;
 
-    const newWallet: TrackedWallet = {
+    let newWallet: TrackedWallet = {
       id: `wallet-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       address: trimmed,
       label: label.trim() || `${trimmed.slice(0, 4)}...${trimmed.slice(-4)}`,
       category: category || 'Other',
       notes: notes?.trim() || '',
       addedAt: Date.now(),
-      // Strict rule: only marked owner-verified if currently authenticated with signature
       isOwnerVerified: isConnectedUser,
       colorTag: isConnectedUser ? '#387B60' : '#7D8A89',
     };
 
+    // Try server API first
+    try {
+      const res = await fetch('/api/wallets/tracked', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          address: trimmed,
+          label: newWallet.label,
+          category: newWallet.category,
+          notes: newWallet.notes,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.wallet) {
+          newWallet = data.wallet;
+        }
+      }
+    } catch {}
+
     const next = [newWallet, ...wallets];
     save(next);
-
-    if (isSupabaseConfigured()) {
-      const supabase = getSupabaseBrowserClient();
-      if (supabase) {
-        Promise.resolve(
-          supabase.from('tracked_wallets').insert({
-            address: trimmed,
-            label: newWallet.label,
-            category: newWallet.category,
-            notes: newWallet.notes,
-            color_tag: newWallet.colorTag,
-            is_owner_verified: newWallet.isOwnerVerified,
-          })
-        ).catch(() => {});
-      }
-    }
 
     return { success: true };
   }, [wallets, currentConnectedAddress, save]);
 
-  const removeWallet = useCallback((id: string) => {
-    const next = wallets.filter(w => w.id !== id);
+  const removeWallet = useCallback(async (id: string) => {
+    const next = wallets.filter((w) => w.id !== id);
     save(next);
 
-    if (isSupabaseConfigured()) {
-      const supabase = getSupabaseBrowserClient();
-      if (supabase) {
-        Promise.resolve(
-          supabase.from('tracked_wallets').delete().eq('id', id)
-        ).catch(() => {});
-      }
-    }
+    try {
+      await fetch(`/api/wallets/tracked?id=${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      });
+    } catch {}
   }, [wallets, save]);
 
   const updateWallet = useCallback((
     id: string,
     updates: Partial<Pick<TrackedWallet, 'label' | 'category' | 'notes' | 'colorTag'>>
   ) => {
-    const next = wallets.map(w => (w.id === id ? { ...w, ...updates } : w));
+    const next = wallets.map((w) => (w.id === id ? { ...w, ...updates } : w));
     save(next);
   }, [wallets, save]);
 

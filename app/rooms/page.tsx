@@ -87,7 +87,7 @@ export default function RoomsPage() {
   const activeWatchlist = activeRoomId ? watchlists[activeRoomId] || [] : [];
   const activeMembers = activeRoomId ? members[activeRoomId] || [] : [];
 
-  const handleCreateSubmit = (e: React.FormEvent) => {
+  const handleCreateSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newRoomName.trim()) return;
 
@@ -96,17 +96,17 @@ export default function RoomsPage() {
       .map(t => t.trim())
       .filter(Boolean);
 
-    const created = createRoom(newRoomName.trim(), newRoomDesc.trim(), newRoomPrivate, tags);
+    const created = await createRoom(newRoomName.trim(), newRoomDesc.trim(), newRoomPrivate, tags);
     setShowCreateModal(false);
     setNewRoomName('');
     setNewRoomDesc('');
-    setActiveRoomId(created.id);
+    if (created?.id) setActiveRoomId(created.id);
   };
 
-  const handleJoinSubmit = (e: React.FormEvent) => {
+  const handleJoinSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setJoinError(null);
-    const res = joinRoomByInvite(joinCode);
+    const res = await joinRoomByInvite(joinCode);
     if (!res.success) {
       setJoinError(res.error || 'Failed to join room');
       return;

@@ -47,7 +47,7 @@ export function useAlphaRooms(currentUserAddress?: string | null) {
   const [isLoaded, setIsLoaded] = useState(false);
   const [cloudSynced, setCloudSynced] = useState(false);
 
-  // Load from persistent storage + Supabase if configured
+  // Load from persistent storage + server API
   useEffect(() => {
     let isMounted = true;
 
@@ -74,69 +74,24 @@ export function useAlphaRooms(currentUserAddress?: string | null) {
     }
     setIsLoaded(true);
 
-    // 2. Cloud Supabase Sync & Realtime Subscription
+    // 2. Fetch authenticated rooms from server API
+    fetch('/api/rooms')
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.rooms && data.rooms.length > 0 && isMounted) {
+          setRooms(data.rooms);
+          setCloudSynced(true);
+          try {
+            localStorage.setItem(ROOMS_KEY, JSON.stringify(data.rooms));
+          } catch {}
+        }
+      })
+      .catch(() => {});
+
+    // 3. Supabase Realtime Subscription if configured
     if (isSupabaseConfigured()) {
       const supabase = getSupabaseBrowserClient();
       if (supabase) {
-        // Fetch rooms
-        Promise.resolve(
-          supabase
-            .from('trading_rooms')
-            .select('*')
-            .order('created_at', { ascending: false })
-        )
-          .then(({ data: dbRooms, error }) => {
-            if (!error && dbRooms && dbRooms.length > 0 && isMounted) {
-              const mappedRooms: AlphaRoom[] = dbRooms.map((r) => ({
-                id: r.id,
-                name: r.name,
-                slug: r.slug,
-                description: r.description || '',
-                isPrivate: r.is_private,
-                inviteCode: r.invite_code,
-                memberCount: r.max_members || 1,
-                createdBy: r.created_by,
-                createdAt: new Date(r.created_at).getTime(),
-                tags: r.tags || [],
-                currentUserRole: r.created_by === currentUserAddress ? 'admin' : 'member',
-              }));
-              setRooms(mappedRooms);
-              setCloudSynced(true);
-            }
-          })
-          .catch(() => {});
-
-        // Fetch posts
-        Promise.resolve(
-          supabase
-            .from('room_posts')
-            .select('*')
-            .order('created_at', { ascending: false })
-            .limit(100)
-        )
-          .then(({ data: dbPosts, error }) => {
-            if (!error && dbPosts && isMounted) {
-              const postsByRoom: Record<string, RoomPost[]> = {};
-              for (const p of dbPosts) {
-                if (!postsByRoom[p.room_id]) postsByRoom[p.room_id] = [];
-                postsByRoom[p.room_id]!.push({
-                  id: p.id,
-                  roomId: p.room_id,
-                  authorId: p.author_id,
-                  authorAddress: p.author_id,
-                  authorName: `${p.author_id.slice(0, 4)}...${p.author_id.slice(-4)}`,
-                  content: p.content,
-                  postType: p.post_type,
-                  tradeData: p.metadata?.tradeData,
-                  createdAt: new Date(p.created_at).getTime(),
-                });
-              }
-              setPosts((prev) => ({ ...prev, ...postsByRoom }));
-            }
-          })
-          .catch(() => {});
-
-        // Realtime subscription on room_posts
         const channel = supabase
           .channel('public:room_posts')
           .on(
@@ -185,6 +140,30 @@ export function useAlphaRooms(currentUserAddress?: string | null) {
     };
   }, [currentUserAddress]);
 
+  // When active room changes, fetch fresh posts from server API
+  useEffect(() => {
+    if (!activeRoomId) return;
+
+    fetch(`/api/rooms/${activeRoomId}/posts`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.posts && Array.isArray(data.posts)) {
+          setPosts((prev) => ({
+            ...prev,
+            [activeRoomId]: data.posts,
+          }));
+          try {
+            const currentStored = JSON.parse(localStorage.getItem(POSTS_KEY) || '{}');
+            localStorage.setItem(
+              POSTS_KEY,
+              JSON.stringify({ ...currentStored, [activeRoomId]: data.posts })
+            );
+          } catch {}
+        }
+      })
+      .catch(() => {});
+  }, [activeRoomId]);
+
   const saveRooms = useCallback((newRooms: AlphaRoom[]) => {
     try {
       localStorage.setItem(ROOMS_KEY, JSON.stringify(newRooms));
@@ -213,24 +192,24 @@ export function useAlphaRooms(currentUserAddress?: string | null) {
     setMembers(newMembers);
   }, []);
 
-  // Create room
-  const createRoom = useCallback((
+  // Create room with server verification
+  const createRoom = useCallback(async (
     name: string,
     description: string,
     isPrivate: boolean,
     tags: string[]
-  ): AlphaRoom => {
+  ): Promise<AlphaRoom> => {
     const user = currentUserAddress || 'Anonymous-User';
-    const id = `room-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    const inviteCode = `SYNC-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+    const fallbackId = `room-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const fallbackInviteCode = `SYNC-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
 
-    const newRoom: AlphaRoom = {
-      id,
+    let newRoom: AlphaRoom = {
+      id: fallbackId,
       name,
       slug: name.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
       description,
       isPrivate,
-      inviteCode,
+      inviteCode: fallbackInviteCode,
       memberCount: 1,
       createdBy: user,
       createdAt: Date.now(),
@@ -238,10 +217,24 @@ export function useAlphaRooms(currentUserAddress?: string | null) {
       currentUserRole: 'admin',
     };
 
+    // Try server API first
+    try {
+      const res = await fetch('/api/rooms', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, description, isPrivate, tags }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.room) {
+          newRoom = data.room;
+        }
+      }
+    } catch {}
+
     const nextRooms = [newRoom, ...rooms];
     saveRooms(nextRooms);
 
-    // Initial member entry
     const initialMember: RoomMember = {
       userId: `user-${user.slice(0, 8)}`,
       walletAddress: user,
@@ -249,34 +242,42 @@ export function useAlphaRooms(currentUserAddress?: string | null) {
       role: 'admin',
       joinedAt: Date.now(),
     };
-    const nextMembers = { ...members, [id]: [initialMember] };
+    const nextMembers = { ...members, [newRoom.id]: [initialMember] };
     saveMembers(nextMembers);
-
-    // Cloud insert if Supabase is active
-    if (isSupabaseConfigured()) {
-      const supabase = getSupabaseBrowserClient();
-      if (supabase) {
-        Promise.resolve(
-          supabase.from('trading_rooms').insert({
-            name,
-            slug: newRoom.slug,
-            description,
-            is_private: isPrivate,
-            invite_code: inviteCode,
-            tags,
-          })
-        ).catch(() => {});
-      }
-    }
 
     return newRoom;
   }, [currentUserAddress, rooms, members, saveRooms, saveMembers]);
 
-  // Join room by invite code
-  const joinRoomByInvite = useCallback((code: string): { success: boolean; error?: string; room?: AlphaRoom } => {
+  // Join room by invite code with server verification
+  const joinRoomByInvite = useCallback(async (code: string): Promise<{ success: boolean; error?: string; room?: AlphaRoom }> => {
     const trimmed = code.trim().toUpperCase();
-    const targetRoom = rooms.find(r => r.inviteCode.toUpperCase() === trimmed);
 
+    // Try server API first
+    try {
+      const res = await fetch('/api/rooms/join', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ inviteCode: trimmed }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.room) {
+          const joinedRoom: AlphaRoom = data.room;
+          setRooms((prev) => {
+            const exists = prev.some((r) => r.id === joinedRoom.id);
+            const next = exists
+              ? prev.map((r) => (r.id === joinedRoom.id ? joinedRoom : r))
+              : [joinedRoom, ...prev];
+            saveRooms(next);
+            return next;
+          });
+          return { success: true, room: joinedRoom };
+        }
+      }
+    } catch {}
+
+    // Fallback to local check
+    const targetRoom = rooms.find((r) => r.inviteCode.toUpperCase() === trimmed);
     if (!targetRoom) {
       return { success: false, error: 'Invalid invite code or room does not exist.' };
     }
@@ -284,7 +285,7 @@ export function useAlphaRooms(currentUserAddress?: string | null) {
     const user = currentUserAddress || 'Anonymous-User';
     const roomMembers = members[targetRoom.id] || [];
 
-    if (roomMembers.some(m => m.walletAddress === user)) {
+    if (roomMembers.some((m) => m.walletAddress === user)) {
       return { success: true, room: targetRoom };
     }
 
@@ -299,7 +300,7 @@ export function useAlphaRooms(currentUserAddress?: string | null) {
     const updatedMembers = { ...members, [targetRoom.id]: [...roomMembers, newMember] };
     saveMembers(updatedMembers);
 
-    const updatedRooms = rooms.map(r =>
+    const updatedRooms = rooms.map((r) =>
       r.id === targetRoom.id
         ? { ...r, memberCount: r.memberCount + 1, currentUserRole: 'member' as const }
         : r
@@ -309,15 +310,15 @@ export function useAlphaRooms(currentUserAddress?: string | null) {
     return { success: true, room: targetRoom };
   }, [rooms, members, currentUserAddress, saveMembers, saveRooms]);
 
-  // Add post or research note
-  const addPost = useCallback((
+  // Add post or research note with server verification
+  const addPost = useCallback(async (
     roomId: string,
     content: string,
     postType: RoomPost['postType'] = 'note',
     tradeData?: VerifiedTradeRecord
-  ) => {
+  ): Promise<RoomPost> => {
     const user = currentUserAddress || 'Anonymous-User';
-    const newPost: RoomPost = {
+    let newPost: RoomPost = {
       id: `post-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       roomId,
       authorId: `user-${user.slice(0, 8)}`,
@@ -329,24 +330,24 @@ export function useAlphaRooms(currentUserAddress?: string | null) {
       createdAt: Date.now(),
     };
 
+    // Try server API first
+    try {
+      const res = await fetch(`/api/rooms/${roomId}/posts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content, postType, tradeData }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.post) {
+          newPost = data.post;
+        }
+      }
+    } catch {}
+
     const currentRoomPosts = posts[roomId] || [];
     const nextPosts = { ...posts, [roomId]: [newPost, ...currentRoomPosts] };
     savePosts(nextPosts);
-
-    // Cloud insert if Supabase is active
-    if (isSupabaseConfigured()) {
-      const supabase = getSupabaseBrowserClient();
-      if (supabase) {
-        Promise.resolve(
-          supabase.from('room_posts').insert({
-            room_id: roomId,
-            post_type: postType,
-            content,
-            metadata: tradeData ? { tradeData } : {},
-          })
-        ).catch(() => {});
-      }
-    }
 
     return newPost;
   }, [currentUserAddress, posts, savePosts]);
@@ -363,7 +364,7 @@ export function useAlphaRooms(currentUserAddress?: string | null) {
     const user = currentUserAddress || 'Anonymous-User';
     const currentTokens = watchlists[roomId] || [];
 
-    if (currentTokens.some(t => t.mint === mint)) return false;
+    if (currentTokens.some((t) => t.mint === mint)) return false;
 
     const newToken: SharedWatchlistToken = {
       id: `wl-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -385,22 +386,22 @@ export function useAlphaRooms(currentUserAddress?: string | null) {
   // Remove token from room watchlist
   const removeWatchlistToken = useCallback((roomId: string, mint: string) => {
     const currentTokens = watchlists[roomId] || [];
-    const nextTokens = currentTokens.filter(t => t.mint !== mint);
+    const nextTokens = currentTokens.filter((t) => t.mint !== mint);
     saveWatchlists({ ...watchlists, [roomId]: nextTokens });
   }, [watchlists, saveWatchlists]);
 
   // Remove member (admin action)
   const removeMember = useCallback((roomId: string, memberAddress: string): boolean => {
-    const room = rooms.find(r => r.id === roomId);
+    const room = rooms.find((r) => r.id === roomId);
     if (!room || room.currentUserRole !== 'admin') {
       return false;
     }
 
     const roomMembers = members[roomId] || [];
-    const updatedMembers = roomMembers.filter(m => m.walletAddress !== memberAddress);
+    const updatedMembers = roomMembers.filter((m) => m.walletAddress !== memberAddress);
     saveMembers({ ...members, [roomId]: updatedMembers });
 
-    const updatedRooms = rooms.map(r =>
+    const updatedRooms = rooms.map((r) =>
       r.id === roomId ? { ...r, memberCount: Math.max(1, r.memberCount - 1) } : r
     );
     saveRooms(updatedRooms);
@@ -412,10 +413,10 @@ export function useAlphaRooms(currentUserAddress?: string | null) {
   const leaveRoom = useCallback((roomId: string): boolean => {
     const user = currentUserAddress || 'Anonymous-User';
     const roomMembers = members[roomId] || [];
-    const updatedMembers = roomMembers.filter(m => m.walletAddress !== user);
+    const updatedMembers = roomMembers.filter((m) => m.walletAddress !== user);
     saveMembers({ ...members, [roomId]: updatedMembers });
 
-    const updatedRooms = rooms.map(r =>
+    const updatedRooms = rooms.map((r) =>
       r.id === roomId ? { ...r, memberCount: Math.max(0, r.memberCount - 1), currentUserRole: undefined } : r
     );
     saveRooms(updatedRooms);

@@ -11,7 +11,7 @@ import { getSolscanWalletUrl } from '../../lib/utils';
 
 interface TrackedWalletsManagerProps {
   wallets: TrackedWallet[];
-  onAddWallet: (address: string, label: string, category: TrackedWallet['category'], notes: string) => { success: boolean; error?: string };
+  onAddWallet: (address: string, label: string, category: TrackedWallet['category'], notes: string) => { success: boolean; error?: string } | Promise<{ success: boolean; error?: string }>;
   onRemoveWallet: (id: string) => void;
   onSelectWallet?: (address: string) => void;
 }
@@ -29,10 +29,10 @@ export const TrackedWalletsManager: FC<TrackedWalletsManagerProps> = ({
   const [notes, setNotes] = useState('');
   const [error, setError] = useState<string | null>(null);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
-    const result = onAddWallet(address, label, category, notes);
+    const result = await onAddWallet(address, label, category, notes);
     if (!result.success) {
       setError(result.error || 'Failed to add wallet');
       return;
