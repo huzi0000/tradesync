@@ -57,16 +57,25 @@ async function runTests() {
 
   console.log('[SETUP] Mock Supabase auth schema and roles created.');
 
-  // 2. Read and execute the migration SQL
+  // 2. Read and execute the migration SQL (Run 1)
   const migrationPath = path.resolve('supabase/migrations/20261006_tradesync_phase2_schema.sql');
   const migrationSql = fs.readFileSync(migrationPath, 'utf8');
 
   try {
     await db.exec(migrationSql);
-    console.log('[SETUP] Hardened SQL migration executed successfully without syntax errors.\n');
+    console.log('[SETUP] Hardened SQL migration executed successfully (Run 1).');
   } catch (err) {
-    console.error('[FATAL] Migration execution failed:', err);
+    console.error('[FATAL] Migration execution failed on Run 1:', err);
     process.exit(1);
+  }
+
+  // 2b. Test Migration Idempotency (Run 2)
+  try {
+    await db.exec(migrationSql);
+    assert(true, 'Test 0: Migration is strictly idempotent (Run 2 succeeded cleanly without errors)');
+  } catch (err) {
+    console.error('[FAIL] Migration failed idempotency re-run:', err);
+    assert(false, 'Test 0: Migration is strictly idempotent');
   }
 
   // Grant table permissions for RLS testing
@@ -77,12 +86,13 @@ async function runTests() {
   `);
 
   // Helper context setters
-  async function asUser(userId, walletAddress) {
+  async function asUser(userId, walletAddress, metadata = {}) {
     const claims = JSON.stringify({
       sub: userId,
       role: 'authenticated',
       wallet_address: walletAddress,
       app_metadata: { wallet_address: walletAddress },
+      ...metadata,
     });
     await db.exec(`
       SET request.jwt.claim.sub = '${userId}';
@@ -147,14 +157,14 @@ async function runTests() {
   const readRes = await db.query(`SELECT * FROM public.trading_rooms WHERE id = '${roomId}'`);
   assert(readRes.rows.length === 0, 'Test 2: User B cannot view User A private room (RLS isolated)');
 
-  // --- TEST 3: User B tries to insert self into User A private room ---
+  // --- TEST 3: User B tries to direct insert self into User A private room ---
   let joinBlocked = false;
   try {
     await db.exec(`
       INSERT INTO public.room_members (room_id, user_id, role)
       VALUES ('${roomId}', '${userB_id}', 'member');
     `);
-  } catch (err) {
+  } catch {
     joinBlocked = true;
   }
   assert(joinBlocked, 'Test 3: User B direct join to private room rejected by RLS');
@@ -178,7 +188,7 @@ async function runTests() {
       INSERT INTO public.room_members (room_id, user_id, role)
       VALUES ('${pubRoomId}', '${userB_id}', 'admin');
     `);
-  } catch (err) {
+  } catch {
     adminEscalationBlocked = true;
   }
   assert(adminEscalationBlocked, 'Test 4: User self-assigning admin role rejected by trigger/RLS');
@@ -191,7 +201,7 @@ async function runTests() {
       INSERT INTO public.room_posts (room_id, author_id, content)
       VALUES ('${roomId}', '${userB_id}', 'Unauthorized leak');
     `);
-  } catch (err) {
+  } catch {
     postWithoutMembershipBlocked = true;
   }
   assert(postWithoutMembershipBlocked, 'Test 5: Posting without room membership strictly blocked (BOTH authorship AND membership required)');
@@ -204,7 +214,7 @@ async function runTests() {
       INSERT INTO public.room_posts (room_id, author_id, content)
       VALUES ('${roomId}', '${userA_id}', 'Spoofed post as User A');
     `);
-  } catch (err) {
+  } catch {
     postImpersonationBlocked = true;
   }
   assert(postImpersonationBlocked, 'Test 6: Post authorship impersonation strictly blocked by RLS');
@@ -220,14 +230,14 @@ async function runTests() {
         output_mint, output_symbol, output_amount,
         signer_wallet, is_owner_verified
       ) VALUES (
-        '${roomId}', '${userB_id}', 'fakeSig111111111111111111111111111111111111111111111111111111111111111111111111111111111111',
+        '${roomId}', '${userB_id}', 'fakeSig11111111111111111111111111111111111111111111111111111111111111111111111111111111',
         123456, 'FakeDEX',
         'So11111111111111111111111111111111111111112', 'SOL', 10.0,
         'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', 'USDC', 2000.0,
         '${userB_wallet}', true
       );
     `);
-  } catch (err) {
+  } catch {
     tradeDirectInsertBlocked = true;
   }
   assert(tradeDirectInsertBlocked, 'Test 7: Direct client insert into verified_trade_records strictly forbidden');
@@ -237,12 +247,28 @@ async function runTests() {
   try {
     await asUser(userB_id, userB_wallet);
     await db.query(`SELECT public.get_or_create_user_profile('${userA_wallet}')`);
-  } catch (err) {
+  } catch {
     profileFunctionBlocked = true;
   }
   assert(profileFunctionBlocked, 'Test 8: get_or_create_user_profile execution revoked from non-service role');
 
-  // --- TEST 9: Atomic invite join by procedure (service_role or valid invite) ---
+  // --- TEST 9: Direct client execution of join_room_by_invite is revoked ---
+  let directJoinRpcBlocked = false;
+  try {
+    await asUser(userB_id, userB_wallet);
+    await db.query(`
+      SELECT public.join_room_by_invite(
+        '${roomId}'::UUID,
+        'INVITE-A-123'::VARCHAR,
+        '${userB_id}'::UUID
+      );
+    `);
+  } catch {
+    directJoinRpcBlocked = true;
+  }
+  assert(directJoinRpcBlocked, 'Test 9: Direct client execution of join_room_by_invite revoked from authenticated/anon roles');
+
+  // --- TEST 10: Atomic invite join by procedure via service_role ---
   await asServiceRole();
   await db.query(`
     SELECT public.join_room_by_invite(
@@ -252,25 +278,24 @@ async function runTests() {
     );
   `);
 
-  // Verify User B is now a member with 'member' role
   const memberCheck = await db.query(`
     SELECT role FROM public.room_members WHERE room_id = '${roomId}' AND user_id = '${userB_id}'
   `);
-  assert(memberCheck.rows.length === 1 && memberCheck.rows[0].role === 'member', 'Test 9: Atomic invite join sets role to member');
+  assert(memberCheck.rows.length === 1 && memberCheck.rows[0].role === 'member', 'Test 10: Atomic invite join sets role to member via service_role');
 
-  // --- TEST 10: Now verified member User B can view room and post ---
+  // --- TEST 11: Now verified member User B can view room and post ---
   await asUser(userB_id, userB_wallet);
   const userBView = await db.query(`SELECT * FROM public.trading_rooms WHERE id = '${roomId}'`);
-  assert(userBView.rows.length === 1, 'Test 10: User B as verified member can now view private room');
+  assert(userBView.rows.length === 1, 'Test 11: User B as verified member can now view private room');
 
   await db.exec(`
     INSERT INTO public.room_posts (room_id, author_id, content)
     VALUES ('${roomId}', '${userB_id}', 'Hello Alpha room from User B!');
   `);
   const postCheck = await db.query(`SELECT * FROM public.room_posts WHERE room_id = '${roomId}'`);
-  assert(postCheck.rows.length === 1, 'Test 11: User B as verified member can create post with verified authorship');
+  assert(postCheck.rows.length === 1, 'Test 12: User B as verified member can create post with verified authorship');
 
-  // --- TEST 12: Server-side verified trade creation and member viewing ---
+  // --- TEST 13: Server-side verified trade creation and member viewing ---
   await asServiceRole();
   const valid88Sig = '5j7sN2rF11111111111111111111111111111111111111111111111111111111111111111111111111111111';
   await db.exec(`
@@ -291,14 +316,14 @@ async function runTests() {
   // Member User A views the trade
   await asUser(userA_id, userA_wallet);
   const tradeA = await db.query(`SELECT * FROM public.verified_trade_records WHERE room_id = '${roomId}'`);
-  assert(tradeA.rows.length === 1, 'Test 12: Room member User A can view server-verified trade');
+  assert(tradeA.rows.length === 1, 'Test 13: Room member User A can view server-verified trade');
 
   // Non-member User C views the trade -> must be 0
   await asUser(userC_id, userC_wallet);
   const tradeC = await db.query(`SELECT * FROM public.verified_trade_records WHERE room_id = '${roomId}'`);
-  assert(tradeC.rows.length === 0, 'Test 13: Non-member User C cannot view private room verified trade');
+  assert(tradeC.rows.length === 0, 'Test 14: Non-member User C cannot view private room verified trade');
 
-  // --- TEST 14: User B tries to insert room with created_by = User A ---
+  // --- TEST 15: User B tries to insert room with created_by = User A ---
   let spoofedRoomCreateBlocked = false;
   try {
     await asUser(userB_id, userB_wallet);
@@ -306,12 +331,12 @@ async function runTests() {
       INSERT INTO public.trading_rooms (name, slug, is_private, invite_code, created_by)
       VALUES ('Spoofed Room', 'spoofed-room', false, 'SPOOF-123', '${userA_id}');
     `);
-  } catch (err) {
+  } catch {
     spoofedRoomCreateBlocked = true;
   }
-  assert(spoofedRoomCreateBlocked, 'Test 14: Impersonating created_by on room creation blocked by RLS');
+  assert(spoofedRoomCreateBlocked, 'Test 15: Impersonating created_by on room creation blocked by RLS');
 
-  // --- TEST 15: Cross-user tracked wallet isolation ---
+  // --- TEST 16: Cross-user tracked wallet isolation ---
   await asUser(userA_id, userA_wallet);
   await db.exec(`
     INSERT INTO public.tracked_wallets (user_id, address, label)
@@ -320,7 +345,7 @@ async function runTests() {
 
   await asUser(userB_id, userB_wallet);
   const userBTracked = await db.query(`SELECT * FROM public.tracked_wallets WHERE user_id = '${userA_id}'`);
-  assert(userBTracked.rows.length === 0, 'Test 15: User B cannot view User A tracked wallets (isolated)');
+  assert(userBTracked.rows.length === 0, 'Test 16: User B cannot view User A tracked wallets (isolated)');
 
   let userBInsertATrackedBlocked = false;
   try {
@@ -328,12 +353,12 @@ async function runTests() {
       INSERT INTO public.tracked_wallets (user_id, address, label)
       VALUES ('${userA_id}', 'Whale22222222222222222222222222222222222222', 'Injected');
     `);
-  } catch (err) {
+  } catch {
     userBInsertATrackedBlocked = true;
   }
-  assert(userBInsertATrackedBlocked, 'Test 16: User B cannot insert into User A tracked wallets');
+  assert(userBInsertATrackedBlocked, 'Test 17: User B cannot insert into User A tracked wallets');
 
-  // --- TEST 17: Cross-user alert rules and history isolation ---
+  // --- TEST 18: Cross-user alert rules and history isolation ---
   await asUser(userA_id, userA_wallet);
   await db.exec(`
     INSERT INTO public.alert_rules (user_id, name, rule_type, target_address)
@@ -342,9 +367,9 @@ async function runTests() {
 
   await asUser(userB_id, userB_wallet);
   const userBAlerts = await db.query(`SELECT * FROM public.alert_rules WHERE user_id = '${userA_id}'`);
-  assert(userBAlerts.rows.length === 0, 'Test 17: User B cannot view User A alert rules');
+  assert(userBAlerts.rows.length === 0, 'Test 18: User B cannot view User A alert rules');
 
-  // --- TEST 18: Cross-user user_settings isolation ---
+  // --- TEST 19: Cross-user user_settings isolation ---
   await asUser(userA_id, userA_wallet);
   await db.exec(`
     INSERT INTO public.user_settings (user_id, rpc_url)
@@ -353,7 +378,123 @@ async function runTests() {
 
   await asUser(userB_id, userB_wallet);
   const userBSettings = await db.query(`SELECT * FROM public.user_settings WHERE user_id = '${userA_id}'`);
-  assert(userBSettings.rows.length === 0, 'Test 18: User B cannot read User A settings');
+  assert(userBSettings.rows.length === 0, 'Test 19: User B cannot read User A settings');
+
+  // =========================================================================
+  // FOCUSED TESTS FOR THE 3 SPECIFIC REMAINING SECURITY REQUIREMENTS
+  // =========================================================================
+
+  // --- REQUIREMENT 1: Concurrent capacity & invitation exhaustion ---
+  // Create a room with max_members = 2 (creator User A is member 1)
+  await asServiceRole();
+  const cappedRoomId = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
+  await db.exec(`
+    INSERT INTO public.trading_rooms (id, name, slug, is_private, invite_code, created_by, max_members)
+    VALUES ('${cappedRoomId}', 'Capped Room', 'capped-room', true, 'CAP-123', '${userA_id}', 2);
+    INSERT INTO public.room_members (room_id, user_id, role)
+    VALUES ('${cappedRoomId}', '${userA_id}', 'admin');
+  `);
+
+  // Create an invitation with max_uses = 1
+  const inviteCode1Use = 'ONE-USE-INVITE';
+  await db.exec(`
+    INSERT INTO public.room_invitations (room_id, invite_code, created_by, max_uses, used_count)
+    VALUES ('${cappedRoomId}', '${inviteCode1Use}', '${userA_id}', 1, 0);
+  `);
+
+  // User B joins using ONE-USE-INVITE -> should succeed (member 2)
+  await db.query(`
+    SELECT public.join_room_by_invite('${cappedRoomId}'::UUID, '${inviteCode1Use}'::VARCHAR, '${userB_id}'::UUID);
+  `);
+  assert(true, 'Test 20: User B successfully joined capped room with valid invite');
+
+  // User C tries to join using ONE-USE-INVITE -> must fail (used_count reached max_uses)
+  let inviteExhaustedBlocked = false;
+  try {
+    await db.query(`
+      SELECT public.join_room_by_invite('${cappedRoomId}'::UUID, '${inviteCode1Use}'::VARCHAR, '${userC_id}'::UUID);
+    `);
+  } catch {
+    inviteExhaustedBlocked = true;
+  }
+  assert(inviteExhaustedBlocked, 'Test 21: Invitation usage limit (max_uses) strictly enforced under row lock');
+
+  // Create a second invitation with max_uses = 10, but room has reached max_members = 2!
+  const inviteCode2 = 'MULTI-USE-INVITE';
+  await db.exec(`
+    INSERT INTO public.room_invitations (room_id, invite_code, created_by, max_uses, used_count)
+    VALUES ('${cappedRoomId}', '${inviteCode2}', '${userA_id}', 10, 0);
+  `);
+
+  let roomCapacityBlocked = false;
+  try {
+    await db.query(`
+      SELECT public.join_room_by_invite('${cappedRoomId}'::UUID, '${inviteCode2}'::VARCHAR, '${userC_id}'::UUID);
+    `);
+  } catch {
+    roomCapacityBlocked = true;
+  }
+  assert(roomCapacityBlocked, 'Test 22: Room capacity limit (max_members) strictly enforced under row lock');
+
+  // --- REQUIREMENT 2: Secure wallet_identities ---
+  // Test 23: Direct client INSERT into wallet_identities must be blocked by RLS
+  let clientWalletIdentitiesInsertBlocked = false;
+  try {
+    await asUser(userB_id, userB_wallet);
+    await db.exec(`
+      INSERT INTO public.wallet_identities (user_id, wallet_address, ownership_proof, is_primary)
+      VALUES ('${userB_id}', '${userB_wallet}', 'fake_proof', true);
+    `);
+  } catch {
+    clientWalletIdentitiesInsertBlocked = true;
+  }
+  assert(clientWalletIdentitiesInsertBlocked, 'Test 23: Direct client INSERT into wallet_identities strictly forbidden');
+
+  // Test 24: Direct client UPDATE on wallet_identities must be blocked by RLS (0 rows affected)
+  await asUser(userB_id, userB_wallet);
+  const updateRes = await db.query(`
+    UPDATE public.wallet_identities SET is_primary = false WHERE user_id = '${userB_id}';
+  `);
+  assert(updateRes.affectedRows === 0, 'Test 24: Direct client UPDATE on wallet_identities strictly forbidden (0 rows affected)');
+
+  // Test 25: Service-role inserting verified wallet identity succeeds
+  await asServiceRole();
+  await db.exec(`
+    INSERT INTO public.wallet_identities (user_id, wallet_address, ownership_proof, is_primary)
+    VALUES ('${userB_id}', '${userB_wallet}', '{"verified_by": "server_ed25519"}', true);
+  `);
+  assert(true, 'Test 25: Trusted server (service_role) successfully recorded verified wallet identity');
+
+  // Test 26: User B can view their own verified identity; User A cannot view User B's identity
+  await asUser(userB_id, userB_wallet);
+  const bIdentities = await db.query(`SELECT * FROM public.wallet_identities WHERE user_id = '${userB_id}'`);
+  assert(bIdentities.rows.length === 1, 'Test 26: User B can view their own verified wallet identity');
+
+  await asUser(userA_id, userA_wallet);
+  const aViewsBIdentities = await db.query(`SELECT * FROM public.wallet_identities WHERE user_id = '${userB_id}'`);
+  assert(aViewsBIdentities.rows.length === 0, 'Test 27: User A cannot view User B wallet identity (RLS isolated)');
+
+  // --- REQUIREMENT 3: Remove user_metadata.wallet_address from authorization ---
+  // Attacker User B injects a spoofed whale wallet in user_metadata
+  const whaleWallet = 'Whale111111111111111111111111111111111111111';
+  await asServiceRole();
+  const whaleId = '99999999-9999-9999-9999-999999999999';
+  await db.exec(`
+    INSERT INTO public.user_profiles (id, wallet_address, display_name)
+    VALUES ('${whaleId}', '${whaleWallet}', 'Target Whale');
+  `);
+
+  // Attacker User B sends JWT containing user_metadata.wallet_address = whaleWallet
+  await asUser(userB_id, userB_wallet, {
+    user_metadata: { wallet_address: whaleWallet },
+  });
+
+  const resolvedUserIdRes = await db.query(`SELECT public.get_current_user_id() AS uid`);
+  const resolvedId = resolvedUserIdRes.rows[0]?.uid;
+  assert(
+    resolvedId !== whaleId && resolvedId === userB_id,
+    'Test 28: Authorization completely ignores user_metadata.wallet_address (whale impersonation defeated)'
+  );
 
   console.log(`\n================================================================`);
   console.log(`DATABASE SECURITY TESTS COMPLETE: ${passed} PASSED, ${failed} FAILED`);

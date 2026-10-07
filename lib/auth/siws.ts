@@ -190,18 +190,42 @@ export function verifyWalletSignature(
 
     const verified = crypto.verify(null, messageBuffer, cryptoPublicKey, signatureBuffer);
 
-    // If Supabase is connected, record identity verification asynchronously
+    // If Supabase is connected, record server-verified identity asynchronously
     if (verified) {
       const supabase = getSupabaseServerClient();
       if (supabase) {
         Promise.resolve(
-          supabase
-            .from('user_profiles')
-            .upsert(
-              { wallet_address: address, updated_at: new Date().toISOString() },
-              { onConflict: 'wallet_address' }
-            )
-        ).catch((err: unknown) => console.error('Supabase profile sync error:', err));
+          (async () => {
+            const { data: profile } = await supabase
+              .from('user_profiles')
+              .upsert(
+                { wallet_address: address, updated_at: new Date().toISOString() },
+                { onConflict: 'wallet_address' }
+              )
+              .select('id')
+              .single();
+
+            if (profile?.id) {
+              await supabase
+                .from('wallet_identities')
+                .upsert(
+                  {
+                    user_id: profile.id,
+                    wallet_address: address,
+                    verified_at: new Date().toISOString(),
+                    ownership_proof: JSON.stringify({
+                      protocol: 'ed25519_siws',
+                      nonce,
+                      signaturePrefix: signatureHex.slice(0, 32),
+                      timestamp: Date.now(),
+                    }),
+                    is_primary: true,
+                  },
+                  { onConflict: 'user_id,wallet_address' }
+                );
+            }
+          })()
+        ).catch((err: unknown) => console.error('Supabase profile/identity sync error:', err));
       }
     }
 

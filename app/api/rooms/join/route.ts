@@ -76,11 +76,18 @@ export async function POST(request: NextRequest) {
       .single();
 
     if (!existingMember) {
-      await supabase.from('room_members').insert({
-        room_id: room.id,
-        user_id: profile.id,
-        role: 'member',
+      const { error: joinErr } = await supabase.rpc('join_room_by_invite', {
+        p_room_id: room.id,
+        p_invite_code: inviteCode.trim(),
+        p_user_id: profile.id,
       });
+
+      if (joinErr) {
+        return NextResponse.json(
+          { error: joinErr.message || 'Failed to join room' },
+          { status: 400 }
+        );
+      }
     }
 
     const alphaRoom: AlphaRoom = {

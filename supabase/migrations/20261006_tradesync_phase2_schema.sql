@@ -239,7 +239,6 @@ AS $$
   WHERE (auth.uid() IS NOT NULL AND id = auth.uid())
      OR (NULLIF(auth.jwt() ->> 'wallet_address', '') IS NOT NULL AND wallet_address = (auth.jwt() ->> 'wallet_address'))
      OR (NULLIF(auth.jwt() -> 'app_metadata' ->> 'wallet_address', '') IS NOT NULL AND wallet_address = (auth.jwt() -> 'app_metadata' ->> 'wallet_address'))
-     OR (NULLIF(auth.jwt() -> 'user_metadata' ->> 'wallet_address', '') IS NOT NULL AND wallet_address = (auth.jwt() -> 'user_metadata' ->> 'wallet_address'))
   LIMIT 1;
 $$;
 
@@ -342,33 +341,45 @@ DECLARE
   v_invitation RECORD;
   v_room RECORD;
   v_current_count INT;
+  v_caller_role TEXT;
+  v_current_user_id UUID;
 BEGIN
   IF p_user_id IS NULL OR p_room_id IS NULL OR p_invite_code IS NULL THEN
     RAISE EXCEPTION 'Invalid parameters for joining room.';
   END IF;
 
-  -- Verify room exists
-  SELECT * INTO v_room FROM public.trading_rooms WHERE id = p_room_id;
+  -- Validate caller identity: only service_role or matching authenticated user
+  v_caller_role := COALESCE(NULLIF(current_setting('request.jwt.claim.role', true), ''), auth.role());
+  v_current_user_id := public.get_current_user_id();
+
+  IF v_caller_role IS NOT NULL AND v_caller_role NOT IN ('service_role', 'supabase_admin') THEN
+    IF v_current_user_id IS NULL OR v_current_user_id != p_user_id THEN
+      RAISE EXCEPTION 'Unauthorized: cannot join room on behalf of another user.';
+    END IF;
+  END IF;
+
+  -- Lock the room row to serialize concurrent joins and prevent oversubscribing capacity
+  SELECT * INTO v_room FROM public.trading_rooms WHERE id = p_room_id FOR UPDATE;
   IF v_room IS NULL THEN
     RAISE EXCEPTION 'Room not found.';
   END IF;
 
-  -- If room is private, validate invite code
+  -- If room is private, lock and validate invitation to serialize concurrent usage
   IF v_room.is_private THEN
-    -- Check room invitation record or default room invite code
     SELECT * INTO v_invitation
     FROM public.room_invitations
     WHERE room_id = p_room_id
       AND invite_code = p_invite_code
       AND (expires_at IS NULL OR expires_at > NOW())
-      AND used_count < max_uses;
+      AND used_count < max_uses
+    FOR UPDATE;
 
     IF v_invitation IS NULL AND v_room.invite_code != p_invite_code THEN
-      RAISE EXCEPTION 'Invalid or expired invitation code.';
+      RAISE EXCEPTION 'Invalid, expired, or exhausted invitation code.';
     END IF;
   END IF;
 
-  -- Check capacity
+  -- Check capacity under row lock
   SELECT COUNT(*) INTO v_current_count FROM public.room_members WHERE room_id = p_room_id;
   IF v_current_count >= v_room.max_members THEN
     RAISE EXCEPTION 'Room has reached maximum member capacity.';
@@ -379,7 +390,7 @@ BEGIN
   VALUES (p_room_id, p_user_id, 'member')
   ON CONFLICT (room_id, user_id) DO NOTHING;
 
-  -- Increment invitation usage if applicable
+  -- Atomically increment invitation usage if using invitation record
   IF v_invitation IS NOT NULL THEN
     UPDATE public.room_invitations
     SET used_count = used_count + 1
@@ -389,6 +400,11 @@ BEGIN
   RETURN TRUE;
 END;
 $$;
+
+-- Restrict execution to trusted server roles
+REVOKE ALL ON FUNCTION public.join_room_by_invite(UUID, VARCHAR, UUID) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.join_room_by_invite(UUID, VARCHAR, UUID) FROM anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.join_room_by_invite(UUID, VARCHAR, UUID) TO service_role;
 
 -- ----------------------------------------------------------------------------
 -- 10. DATABASE INTEGRITY TRIGGERS (DEFENSE IN DEPTH)
@@ -476,6 +492,7 @@ CREATE POLICY "Profiles are viewable by everyone"
     USING (true);
 
 DROP POLICY IF EXISTS "Users can create or update their own profile" ON public.user_profiles;
+DROP POLICY IF EXISTS "Users can create their own profile" ON public.user_profiles;
 CREATE POLICY "Users can create their own profile"
     ON public.user_profiles FOR INSERT
     WITH CHECK (
@@ -483,22 +500,33 @@ CREATE POLICY "Users can create their own profile"
         OR (auth.role() = 'authenticated' AND wallet_address = (auth.jwt() ->> 'wallet_address'))
     );
 
+DROP POLICY IF EXISTS "Users can update their own profile" ON public.user_profiles;
 CREATE POLICY "Users can update their own profile"
     ON public.user_profiles FOR UPDATE
     USING (id = public.get_current_user_id())
     WITH CHECK (id = public.get_current_user_id());
 
--- 11.2 Wallet Identities
+-- 11.2 Wallet Identities (Server-verified only)
 DROP POLICY IF EXISTS "Users view own wallet identities" ON public.wallet_identities;
 CREATE POLICY "Users view own wallet identities"
     ON public.wallet_identities FOR SELECT
     USING (user_id = public.get_current_user_id());
 
 DROP POLICY IF EXISTS "Users manage own wallet identities" ON public.wallet_identities;
-CREATE POLICY "Users manage own wallet identities"
-    ON public.wallet_identities FOR ALL
-    USING (user_id = public.get_current_user_id())
-    WITH CHECK (user_id = public.get_current_user_id());
+DROP POLICY IF EXISTS "Direct client insert forbidden on wallet identities" ON public.wallet_identities;
+CREATE POLICY "Direct client insert forbidden on wallet identities"
+    ON public.wallet_identities FOR INSERT
+    WITH CHECK (false);
+
+DROP POLICY IF EXISTS "Direct client update forbidden on wallet identities" ON public.wallet_identities;
+CREATE POLICY "Direct client update forbidden on wallet identities"
+    ON public.wallet_identities FOR UPDATE
+    USING (false);
+
+DROP POLICY IF EXISTS "Users can remove own secondary wallet identities" ON public.wallet_identities;
+CREATE POLICY "Users can remove own secondary wallet identities"
+    ON public.wallet_identities FOR DELETE
+    USING (user_id = public.get_current_user_id() AND NOT is_primary);
 
 -- 11.3 Tracked Wallets
 DROP POLICY IF EXISTS "Users manage their own tracked wallets" ON public.tracked_wallets;
@@ -551,6 +579,7 @@ CREATE POLICY "Room members viewable by members or public room"
     );
 
 DROP POLICY IF EXISTS "Members can join public rooms only" ON public.room_members;
+DROP POLICY IF EXISTS "Users can insert room membership" ON public.room_members;
 CREATE POLICY "Users can insert room membership"
     ON public.room_members FOR INSERT
     WITH CHECK (
@@ -607,6 +636,7 @@ CREATE POLICY "Room posts viewable by members or public"
     );
 
 DROP POLICY IF EXISTS "Room members can create posts" ON public.room_posts;
+DROP POLICY IF EXISTS "Verified room members can create posts" ON public.room_posts;
 CREATE POLICY "Verified room members can create posts"
     ON public.room_posts FOR INSERT
     WITH CHECK (
@@ -617,6 +647,7 @@ CREATE POLICY "Verified room members can create posts"
     );
 
 DROP POLICY IF EXISTS "Post authors can delete their posts" ON public.room_posts;
+DROP POLICY IF EXISTS "Post authors or room admins can delete posts" ON public.room_posts;
 CREATE POLICY "Post authors or room admins can delete posts"
     ON public.room_posts FOR DELETE
     USING (
@@ -636,14 +667,17 @@ CREATE POLICY "Verified trades viewable by room members or public"
 
 -- Direct client INSERT is completely forbidden to prevent trade forgery
 DROP POLICY IF EXISTS "Members can submit verified trades" ON public.verified_trade_records;
+DROP POLICY IF EXISTS "Direct client insert forbidden on verified trades" ON public.verified_trade_records;
 CREATE POLICY "Direct client insert forbidden on verified trades"
     ON public.verified_trade_records FOR INSERT
     WITH CHECK (false);
 
+DROP POLICY IF EXISTS "Direct client update forbidden on verified trades" ON public.verified_trade_records;
 CREATE POLICY "Direct client update forbidden on verified trades"
     ON public.verified_trade_records FOR UPDATE
     USING (false);
 
+DROP POLICY IF EXISTS "Direct client delete forbidden on verified trades" ON public.verified_trade_records;
 CREATE POLICY "Direct client delete forbidden on verified trades"
     ON public.verified_trade_records FOR DELETE
     USING (false);
