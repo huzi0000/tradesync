@@ -41,7 +41,7 @@ export async function GET(
         .from('user_profiles')
         .select('id')
         .eq('wallet_address', session.walletAddress)
-        .single();
+        .maybeSingle();
 
       if (!profile) {
         return NextResponse.json({ error: 'Access denied to private room' }, { status: 403 });
@@ -52,7 +52,7 @@ export async function GET(
         .select('role')
         .eq('room_id', roomId)
         .eq('user_id', profile.id)
-        .single();
+        .maybeSingle();
 
       if (!membership && room.created_by !== profile.id) {
         return NextResponse.json({ error: 'Access denied: not a room member' }, { status: 403 });
@@ -133,7 +133,7 @@ export async function POST(
       .from('user_profiles')
       .select('id, display_name')
       .eq('wallet_address', session.walletAddress)
-      .single();
+      .maybeSingle();
 
     if (!profile) {
       return NextResponse.json({ error: 'User profile not found' }, { status: 403 });
@@ -145,14 +145,14 @@ export async function POST(
       .select('role')
       .eq('room_id', roomId)
       .eq('user_id', profile.id)
-      .single();
+      .maybeSingle();
 
     // Also check if user is the room creator
     const { data: room } = await supabase
       .from('trading_rooms')
       .select('created_by')
       .eq('id', roomId)
-      .single();
+      .maybeSingle();
 
     if (!membership && room?.created_by !== profile.id) {
       return NextResponse.json({ error: 'Only room members can post messages' }, { status: 403 });

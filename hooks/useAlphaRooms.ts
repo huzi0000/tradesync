@@ -251,32 +251,67 @@ export function useAlphaRooms(currentUserAddress?: string | null) {
   // Join room by invite code with server verification
   const joinRoomByInvite = useCallback(async (code: string): Promise<{ success: boolean; error?: string; room?: AlphaRoom }> => {
     const trimmed = code.trim().toUpperCase();
+    if (!trimmed) {
+      return { success: false, error: 'Please enter an invite code.' };
+    }
 
     // Try server API first
     try {
       const res = await fetch('/api/rooms/join', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({ inviteCode: trimmed }),
       });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.room) {
-          const joinedRoom: AlphaRoom = data.room;
-          setRooms((prev) => {
-            const exists = prev.some((r) => r.id === joinedRoom.id);
-            const next = exists
-              ? prev.map((r) => (r.id === joinedRoom.id ? joinedRoom : r))
-              : [joinedRoom, ...prev];
-            saveRooms(next);
-            return next;
-          });
-          return { success: true, room: joinedRoom };
-        }
-      }
-    } catch {}
 
-    // Fallback to local check
+      const data = await res.json().catch(() => null);
+
+      if (res.ok && data?.room) {
+        const joinedRoom: AlphaRoom = data.room;
+        setRooms((prev) => {
+          const exists = prev.some((r) => r.id === joinedRoom.id);
+          const next = exists
+            ? prev.map((r) => (r.id === joinedRoom.id ? joinedRoom : r))
+            : [joinedRoom, ...prev];
+          saveRooms(next);
+          return next;
+        });
+
+        // Also add member record locally if user wallet exists
+        if (currentUserAddress) {
+          setMembers((prev) => {
+            const currentList = prev[joinedRoom.id] || [];
+            if (!currentList.some((m) => m.walletAddress === currentUserAddress)) {
+              const newM: RoomMember = {
+                userId: `user-${currentUserAddress.slice(0, 8)}`,
+                walletAddress: currentUserAddress,
+                displayName: `${currentUserAddress.slice(0, 4)}...${currentUserAddress.slice(-4)}`,
+                role: joinedRoom.currentUserRole || 'member',
+                joinedAt: Date.now(),
+              };
+              const updated = { ...prev, [joinedRoom.id]: [...currentList, newM] };
+              saveMembers(updated);
+              return updated;
+            }
+            return prev;
+          });
+        }
+
+        return { success: true, room: joinedRoom };
+      }
+
+      // If the server responded with an error, do NOT mask it with a misleading local fallback!
+      if (!res.ok) {
+        return {
+          success: false,
+          error: data?.error || `Failed to join room (HTTP ${res.status})`,
+        };
+      }
+    } catch (netErr) {
+      console.warn('[useAlphaRooms] Server join request unreachable, falling back to local storage:', netErr);
+    }
+
+    // Fallback to local check ONLY when offline / server unreachable
     const targetRoom = rooms.find((r) => r.inviteCode.toUpperCase() === trimmed);
     if (!targetRoom) {
       return { success: false, error: 'Invalid invite code or room does not exist.' };

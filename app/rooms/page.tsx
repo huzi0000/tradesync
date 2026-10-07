@@ -106,7 +106,12 @@ export default function RoomsPage() {
   const handleJoinSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setJoinError(null);
-    const res = await joinRoomByInvite(joinCode);
+    const trimmed = joinCode.trim().toUpperCase();
+    if (!trimmed) {
+      setJoinError('Please enter an invite code');
+      return;
+    }
+    const res = await joinRoomByInvite(trimmed);
     if (!res.success) {
       setJoinError(res.error || 'Failed to join room');
       return;
