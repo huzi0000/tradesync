@@ -46,6 +46,7 @@ export const TradeShareModal: FC<TradeShareModalProps> = ({
       const res = await fetch('/api/trades/verify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({ signature: trimmed, roomId }),
       });
 

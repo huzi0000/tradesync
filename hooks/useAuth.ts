@@ -19,7 +19,7 @@ export function useAuth() {
   const checkSession = useCallback(async () => {
     try {
       setIsLoading(true);
-      const res = await fetch('/api/auth/session');
+      const res = await fetch('/api/auth/session', { credentials: 'include' });
       if (res.ok) {
         const data = (await res.json()) as AuthSession;
         setSession(data);
@@ -68,6 +68,7 @@ export function useAuth() {
       const challengeRes = await fetch('/api/auth/challenge', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({ address }),
       });
 
@@ -91,6 +92,7 @@ export function useAuth() {
       const verifyRes = await fetch('/api/auth/verify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({
           address,
           message: challenge.message,
@@ -122,7 +124,7 @@ export function useAuth() {
 
   const signOut = useCallback(async () => {
     try {
-      await fetch('/api/auth/logout', { method: 'POST' });
+      await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
       setSession({ authenticated: false, walletAddress: null, userId: null });
       if (disconnect) {
         await disconnect();

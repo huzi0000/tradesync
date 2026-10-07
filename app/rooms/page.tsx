@@ -61,6 +61,8 @@ export default function RoomsPage() {
   const [newRoomDesc, setNewRoomDesc] = useState('');
   const [newRoomPrivate, setNewRoomPrivate] = useState(true);
   const [newRoomTags, setNewRoomTags] = useState('Solana, Alpha, Swaps');
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [isCreating, setIsCreating] = useState(false);
 
   // Join form
   const [joinCode, setJoinCode] = useState('');
@@ -71,6 +73,8 @@ export default function RoomsPage() {
 
   // Feed post inputs
   const [postContent, setPostContent] = useState('');
+  const [postError, setPostError] = useState<string | null>(null);
+  const [isPosting, setIsPosting] = useState(false);
 
   // Watchlist inputs
   const [wlMint, setWlMint] = useState('');
@@ -91,16 +95,27 @@ export default function RoomsPage() {
     e.preventDefault();
     if (!newRoomName.trim()) return;
 
+    setCreateError(null);
+    setIsCreating(true);
+
     const tags = newRoomTags
       .split(',')
       .map(t => t.trim())
       .filter(Boolean);
 
-    const created = await createRoom(newRoomName.trim(), newRoomDesc.trim(), newRoomPrivate, tags);
+    const res = await createRoom(newRoomName.trim(), newRoomDesc.trim(), newRoomPrivate, tags);
+    setIsCreating(false);
+
+    if (!res.success || !res.room) {
+      setCreateError(res.error || 'Failed to create room on server');
+      return;
+    }
+
     setShowCreateModal(false);
     setNewRoomName('');
     setNewRoomDesc('');
-    if (created?.id) setActiveRoomId(created.id);
+    setCreateError(null);
+    if (res.room.id) setActiveRoomId(res.room.id);
   };
 
   const handleJoinSubmit = async (e: React.FormEvent) => {
@@ -121,19 +136,29 @@ export default function RoomsPage() {
     if (res.room) setActiveRoomId(res.room.id);
   };
 
-  const handleSendPost = (e: React.FormEvent) => {
+  const handleSendPost = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!activeRoomId || !postContent.trim()) return;
-    addPost(activeRoomId, postContent.trim(), 'note');
+    setPostError(null);
+    setIsPosting(true);
+    const res = await addPost(activeRoomId, postContent.trim(), 'note');
+    setIsPosting(false);
+    if (!res.success) {
+      setPostError(res.error || 'Failed to post message');
+      return;
+    }
     setPostContent('');
   };
 
-  const handleTradeShared = (trade: VerifiedTradeRecord, note: string) => {
+  const handleTradeShared = async (trade: VerifiedTradeRecord, note: string) => {
     if (!activeRoomId) return;
     const content = note
       ? `${note}\n\n[Verified Swap: ${trade.inputToken.amount.toFixed(4)} ${trade.inputToken.symbol} → ${trade.outputToken.amount.toFixed(4)} ${trade.outputToken.symbol} via ${trade.dexName}]`
       : `Shared a verified on-chain swap via ${trade.dexName}`;
-    addPost(activeRoomId, content, 'trade', trade);
+    const res = await addPost(activeRoomId, content, 'trade', trade);
+    if (!res.success) {
+      console.error('[TradeSync] Failed to post shared trade:', res.error);
+    }
   };
 
   const handleAddWatchlistToken = (e: React.FormEvent) => {
@@ -183,11 +208,11 @@ export default function RoomsPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Button size="sm" variant="outline" onClick={() => setShowJoinModal(true)}>
+          <Button size="sm" variant="outline" onClick={() => { setJoinError(null); setShowJoinModal(true); }}>
             <KeyRound size={13} />
             <span>Join via Code</span>
           </Button>
-          <Button size="sm" variant="primary" onClick={() => setShowCreateModal(true)}>
+          <Button size="sm" variant="primary" onClick={() => { setCreateError(null); setShowCreateModal(true); }}>
             <Plus size={13} />
             <span>Create Room</span>
           </Button>
@@ -367,10 +392,14 @@ export default function RoomsPage() {
                   <textarea
                     rows={2}
                     value={postContent}
-                    onChange={e => setPostContent(e.target.value)}
+                    onChange={e => {
+                      setPostContent(e.target.value);
+                      if (postError) setPostError(null);
+                    }}
                     placeholder="Share market insight, on-chain observations, or trade thesis..."
                     className="w-full p-2.5 text-xs text-[#1B2428] bg-[#F8F7F4] border border-[#DEDCD5] rounded focus:outline-none focus:border-[#1B2428]"
                   />
+                  {postError && <p className="text-xs text-[#BA6249]">{postError}</p>}
                   <div className="flex items-center justify-between">
                     <Button
                       type="button"
@@ -381,7 +410,7 @@ export default function RoomsPage() {
                       <Share2 size={13} />
                       <span>Share Verified Swap</span>
                     </Button>
-                    <Button type="submit" size="sm" variant="primary" disabled={!postContent.trim()}>
+                    <Button type="submit" size="sm" variant="primary" disabled={!postContent.trim() || isPosting} loading={isPosting}>
                       <Send size={13} />
                       <span>Post</span>
                     </Button>
@@ -723,11 +752,17 @@ export default function RoomsPage() {
                 </label>
               </div>
 
+              {createError && (
+                <div className="p-2.5 bg-[#FBF0ED] border border-[#EDCCC5] rounded text-xs text-[#BA6249]">
+                  {createError}
+                </div>
+              )}
+
               <div className="flex justify-end gap-2 pt-3 border-t border-[#DAD8D1]">
-                <Button type="button" size="sm" variant="outline" onClick={() => setShowCreateModal(false)}>
+                <Button type="button" size="sm" variant="outline" onClick={() => { setShowCreateModal(false); setCreateError(null); }}>
                   Cancel
                 </Button>
-                <Button type="submit" size="sm" variant="primary">
+                <Button type="submit" size="sm" variant="primary" disabled={isCreating} loading={isCreating}>
                   Create Room
                 </Button>
               </div>

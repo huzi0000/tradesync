@@ -52,7 +52,7 @@ export function useTrackedWallets(currentConnectedAddress?: string | null) {
     setIsLoaded(true);
 
     // Fetch from server API
-    fetch('/api/wallets/tracked')
+    fetch('/api/wallets/tracked', { credentials: 'include' })
       .then((res) => res.json())
       .then((data) => {
         if (data.wallets && data.wallets.length > 0 && isMounted) {
@@ -120,6 +120,7 @@ export function useTrackedWallets(currentConnectedAddress?: string | null) {
       const res = await fetch('/api/wallets/tracked', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({
           address: trimmed,
           label: newWallet.label,
@@ -148,6 +149,7 @@ export function useTrackedWallets(currentConnectedAddress?: string | null) {
     try {
       await fetch(`/api/wallets/tracked?id=${encodeURIComponent(id)}`, {
         method: 'DELETE',
+        credentials: 'include',
       });
     } catch {}
   }, [wallets, save]);

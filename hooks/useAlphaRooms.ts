@@ -75,10 +75,14 @@ export function useAlphaRooms(currentUserAddress?: string | null) {
     setIsLoaded(true);
 
     // 2. Fetch authenticated rooms from server API
-    fetch('/api/rooms')
-      .then((res) => res.json())
+    fetch('/api/rooms', { credentials: 'include' })
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
       .then((data) => {
-        if (data.rooms && data.rooms.length > 0 && isMounted) {
+        if (!isMounted) return;
+        if (!data.standalone && Array.isArray(data.rooms)) {
           setRooms(data.rooms);
           setCloudSynced(true);
           try {
@@ -86,7 +90,9 @@ export function useAlphaRooms(currentUserAddress?: string | null) {
           } catch {}
         }
       })
-      .catch(() => {});
+      .catch((err) => {
+        console.warn('[useAlphaRooms] Failed to fetch rooms from server:', err);
+      });
 
     // 3. Supabase Realtime Subscription if configured
     if (isSupabaseConfigured()) {
@@ -144,8 +150,11 @@ export function useAlphaRooms(currentUserAddress?: string | null) {
   useEffect(() => {
     if (!activeRoomId) return;
 
-    fetch(`/api/rooms/${activeRoomId}/posts`)
-      .then((res) => res.json())
+    fetch(`/api/rooms/${activeRoomId}/posts`, { credentials: 'include' })
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
       .then((data) => {
         if (data.posts && Array.isArray(data.posts)) {
           setPosts((prev) => ({
@@ -161,7 +170,9 @@ export function useAlphaRooms(currentUserAddress?: string | null) {
           } catch {}
         }
       })
-      .catch(() => {});
+      .catch((err) => {
+        console.warn('[useAlphaRooms] Failed to fetch posts for room:', err);
+      });
   }, [activeRoomId]);
 
   const saveRooms = useCallback((newRooms: AlphaRoom[]) => {
@@ -198,54 +209,42 @@ export function useAlphaRooms(currentUserAddress?: string | null) {
     description: string,
     isPrivate: boolean,
     tags: string[]
-  ): Promise<AlphaRoom> => {
-    const user = currentUserAddress || 'Anonymous-User';
-    const fallbackId = `room-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    const fallbackInviteCode = `SYNC-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
-
-    let newRoom: AlphaRoom = {
-      id: fallbackId,
-      name,
-      slug: name.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
-      description,
-      isPrivate,
-      inviteCode: fallbackInviteCode,
-      memberCount: 1,
-      createdBy: user,
-      createdAt: Date.now(),
-      tags,
-      currentUserRole: 'admin',
-    };
-
-    // Try server API first
+  ): Promise<{ success: boolean; room?: AlphaRoom; error?: string }> => {
     try {
       const res = await fetch('/api/rooms', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({ name, description, isPrivate, tags }),
       });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.room) {
-          newRoom = data.room;
-        }
+
+      const data = await res.json().catch(() => null);
+
+      if (!res.ok || !data?.room) {
+        const errorMsg = data?.error || `Failed to create room (HTTP ${res.status})`;
+        return { success: false, error: errorMsg };
       }
-    } catch {}
 
-    const nextRooms = [newRoom, ...rooms];
-    saveRooms(nextRooms);
+      const newRoom: AlphaRoom = data.room;
+      const nextRooms = [newRoom, ...rooms.filter((r) => r.id !== newRoom.id)];
+      saveRooms(nextRooms);
 
-    const initialMember: RoomMember = {
-      userId: `user-${user.slice(0, 8)}`,
-      walletAddress: user,
-      displayName: `${user.slice(0, 4)}...${user.slice(-4)}`,
-      role: 'admin',
-      joinedAt: Date.now(),
-    };
-    const nextMembers = { ...members, [newRoom.id]: [initialMember] };
-    saveMembers(nextMembers);
+      const user = currentUserAddress || newRoom.createdBy;
+      const initialMember: RoomMember = {
+        userId: `user-${user.slice(0, 8)}`,
+        walletAddress: user,
+        displayName: `${user.slice(0, 4)}...${user.slice(-4)}`,
+        role: 'admin',
+        joinedAt: Date.now(),
+      };
+      const nextMembers = { ...members, [newRoom.id]: [initialMember] };
+      saveMembers(nextMembers);
 
-    return newRoom;
+      return { success: true, room: newRoom };
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : 'Network error creating room';
+      return { success: false, error: errorMsg };
+    }
   }, [currentUserAddress, rooms, members, saveRooms, saveMembers]);
 
   // Join room by invite code with server verification
@@ -351,41 +350,36 @@ export function useAlphaRooms(currentUserAddress?: string | null) {
     content: string,
     postType: RoomPost['postType'] = 'note',
     tradeData?: VerifiedTradeRecord
-  ): Promise<RoomPost> => {
-    const user = currentUserAddress || 'Anonymous-User';
-    let newPost: RoomPost = {
-      id: `post-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      roomId,
-      authorId: `user-${user.slice(0, 8)}`,
-      authorAddress: user,
-      authorName: `${user.slice(0, 4)}...${user.slice(-4)}`,
-      content,
-      postType,
-      tradeData,
-      createdAt: Date.now(),
-    };
-
-    // Try server API first
+  ): Promise<{ success: boolean; post?: RoomPost; error?: string }> => {
     try {
       const res = await fetch(`/api/rooms/${roomId}/posts`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({ content, postType, tradeData }),
       });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.post) {
-          newPost = data.post;
-        }
+
+      const data = await res.json().catch(() => null);
+
+      if (!res.ok || !data?.post) {
+        const errorMsg = data?.error || `Failed to post message (HTTP ${res.status})`;
+        return { success: false, error: errorMsg };
       }
-    } catch {}
 
-    const currentRoomPosts = posts[roomId] || [];
-    const nextPosts = { ...posts, [roomId]: [newPost, ...currentRoomPosts] };
-    savePosts(nextPosts);
+      const newPost: RoomPost = data.post;
+      const currentRoomPosts = posts[roomId] || [];
+      const nextPosts = {
+        ...posts,
+        [roomId]: [newPost, ...currentRoomPosts.filter((p) => p.id !== newPost.id)],
+      };
+      savePosts(nextPosts);
 
-    return newPost;
-  }, [currentUserAddress, posts, savePosts]);
+      return { success: true, post: newPost };
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : 'Network error submitting post';
+      return { success: false, error: errorMsg };
+    }
+  }, [posts, savePosts]);
 
   // Add token to room watchlist
   const addWatchlistToken = useCallback((
